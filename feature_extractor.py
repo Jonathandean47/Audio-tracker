@@ -416,18 +416,34 @@ if __name__ == "__main__":
     extractor = FeatureExtractor(mode="image")
     buf = SequenceBuffer(seq_len=30, overlap=15)
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        # Fallback to default backend
+        cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("No camera available — skipping live test.")
     else:
-        print("Camera open. Press Q to quit.")
+        print("Camera open. Warming up...")
+        # Give camera time to initialize (Windows often needs this)
+        import time
+        for _ in range(30):
+            cap.read()
+            time.sleep(0.03)
+
+        print("Press Q to quit.")
         frame_count = 0
         seq_count = 0
+        fail_count = 0
 
         while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                fail_count += 1
+                if fail_count > 30:
+                    print("Camera stopped responding.")
+                    break
+                continue
+            fail_count = 0
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             features = extractor.extract(rgb)
