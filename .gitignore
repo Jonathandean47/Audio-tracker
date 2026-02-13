@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+transcripts/
+asl_data/
+asl_model.pkl
+video_cache/
+todo.md
+models/
