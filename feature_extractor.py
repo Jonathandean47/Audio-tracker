@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import urllib.request
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +65,28 @@ LEFT_HIP = 23
 RIGHT_HIP = 24
 
 DEFAULT_SEQ_LEN = 30  # frames
+
+# Hand skeleton connections (21 landmarks)
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),          # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),          # Index
+    (5, 9), (9, 10), (10, 11), (11, 12),     # Middle
+    (9, 13), (13, 14), (14, 15), (15, 16),   # Ring
+    (13, 17), (17, 18), (18, 19), (19, 20),  # Pinky
+    (0, 17),                                  # Palm base
+]
+
+# Pose connections (upper body — relevant for ASL)
+POSE_UPPER_CONNECTIONS = [
+    (11, 12),              # Shoulders
+    (11, 13), (13, 15),    # Left arm
+    (12, 14), (14, 16),    # Right arm
+    (11, 23), (12, 24),    # Torso sides
+    (23, 24),              # Hips
+]
+
+# Pose landmark indices to draw as joints
+POSE_DRAW_INDICES = {11, 12, 13, 14, 15, 16, 23, 24}
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +159,22 @@ def _normalize_frame(
 
 
 # ---------------------------------------------------------------------------
+# ExtractionResult
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExtractionResult:
+    """Carries both the normalized feature vector and raw landmarks for drawing."""
+    features: np.ndarray | None = None        # (225,) or None if no pose
+    pose_landmarks: list | None = None        # raw MediaPipe pose landmark list
+    hand_landmarks: list = field(default_factory=list)  # raw hand landmark lists
+    handedness: list = field(default_factory=list)       # handedness per detected hand
+    left_detected: bool = False
+    right_detected: bool = False
+    pose_detected: bool = False
+
+
+# ---------------------------------------------------------------------------
 # FeatureExtractor
 # ---------------------------------------------------------------------------
 
@@ -183,6 +222,43 @@ class FeatureExtractor:
 
         self._mode = mode
 
+    def _detect(self, frame_rgb: np.ndarray, timestamp_ms: int = 0):
+        """Run MediaPipe pose + hand detection on a single frame."""
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=frame_rgb,
+        )
+
+        if self._mode == "video":
+            pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
+            hand_result = self._hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+        else:
+            pose_result = self._pose_landmarker.detect(mp_image)
+            hand_result = self._hand_landmarker.detect(mp_image)
+
+        return pose_result, hand_result
+
+    @staticmethod
+    def _sort_hands(hand_result):
+        """Separate hand landmarks into left/right arrays + detection flags."""
+        left_hand = np.zeros((NUM_HAND_LANDMARKS, 3), dtype=np.float32)
+        right_hand = np.zeros((NUM_HAND_LANDMARKS, 3), dtype=np.float32)
+        left_detected = right_detected = False
+
+        if hand_result.hand_landmarks:
+            for i, hand_lms in enumerate(hand_result.hand_landmarks):
+                handedness = hand_result.handedness[i][0]
+                arr = _hand_landmarks_to_array(hand_lms)
+                # MediaPipe reports handedness from camera's perspective (mirrored)
+                if handedness.category_name == "Left":
+                    right_hand = arr
+                    right_detected = True
+                else:
+                    left_hand = arr
+                    left_detected = True
+
+        return left_hand, right_hand, left_detected, right_detected
+
     def extract(
         self,
         frame_rgb: np.ndarray,
@@ -190,60 +266,49 @@ class FeatureExtractor:
     ) -> np.ndarray | None:
         """Extract a 225-dim feature vector from a single RGB frame.
 
-        Parameters
-        ----------
-        frame_rgb : np.ndarray
-            RGB image, shape (H, W, 3), dtype uint8.
-        timestamp_ms : int
-            Timestamp in milliseconds (required for VIDEO mode).
-
-        Returns
-        -------
-        np.ndarray or None
-            Shape (225,) feature vector, or None if pose not detected.
+        Returns (225,) feature vector, or None if pose not detected.
         """
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=frame_rgb,
-        )
-
-        # Detect pose
-        if self._mode == "video":
-            pose_result: PoseLandmarkerResult = self._pose_landmarker.detect_for_video(
-                mp_image, timestamp_ms
-            )
-        else:
-            pose_result: PoseLandmarkerResult = self._pose_landmarker.detect(mp_image)
+        pose_result, hand_result = self._detect(frame_rgb, timestamp_ms)
 
         if not pose_result.pose_landmarks:
             return None
 
         pose = _pose_landmarks_to_array(pose_result.pose_landmarks[0])
-
-        # Detect hands
-        if self._mode == "video":
-            hand_result: HandLandmarkerResult = self._hand_landmarker.detect_for_video(
-                mp_image, timestamp_ms
-            )
-        else:
-            hand_result: HandLandmarkerResult = self._hand_landmarker.detect(mp_image)
-
-        # Sort hands into left/right using handedness labels
-        left_hand = np.zeros((NUM_HAND_LANDMARKS, 3), dtype=np.float32)
-        right_hand = np.zeros((NUM_HAND_LANDMARKS, 3), dtype=np.float32)
-
-        if hand_result.hand_landmarks:
-            for i, hand_lms in enumerate(hand_result.hand_landmarks):
-                handedness = hand_result.handedness[i][0]
-                arr = _hand_landmarks_to_array(hand_lms)
-                # MediaPipe reports handedness from camera perspective
-                # (mirrored): "Left" label = signer's right hand
-                if handedness.category_name == "Left":
-                    right_hand = arr
-                else:
-                    left_hand = arr
-
+        left_hand, right_hand, _, _ = self._sort_hands(hand_result)
         return _normalize_frame(left_hand, right_hand, pose)
+
+    def extract_with_landmarks(
+        self,
+        frame_rgb: np.ndarray,
+        timestamp_ms: int = 0,
+    ) -> ExtractionResult:
+        """Extract features AND return raw landmarks for visualization.
+
+        Always returns an ExtractionResult; features is None if no pose detected.
+        """
+        pose_result, hand_result = self._detect(frame_rgb, timestamp_ms)
+
+        raw_hands = list(hand_result.hand_landmarks) if hand_result.hand_landmarks else []
+        raw_handedness = list(hand_result.handedness) if hand_result.handedness else []
+
+        if not pose_result.pose_landmarks:
+            return ExtractionResult(
+                hand_landmarks=raw_hands,
+                handedness=raw_handedness,
+            )
+
+        pose = _pose_landmarks_to_array(pose_result.pose_landmarks[0])
+        left_hand, right_hand, left_det, right_det = self._sort_hands(hand_result)
+
+        return ExtractionResult(
+            features=_normalize_frame(left_hand, right_hand, pose),
+            pose_landmarks=pose_result.pose_landmarks[0],
+            hand_landmarks=raw_hands,
+            handedness=raw_handedness,
+            left_detected=left_det,
+            right_detected=right_det,
+            pose_detected=True,
+        )
 
     def close(self) -> None:
         """Release MediaPipe resources."""
@@ -401,11 +466,110 @@ def extract_sequences_from_video(
 
 
 # ---------------------------------------------------------------------------
+# Overlay drawing
+# ---------------------------------------------------------------------------
+
+def draw_overlay(
+    frame: np.ndarray,
+    result: ExtractionResult,
+    buffer: SequenceBuffer,
+    frame_count: int = 0,
+    seq_count: int = 0,
+) -> None:
+    """Draw landmark skeletons and a HUD on a BGR video frame (in-place)."""
+    import cv2
+
+    h, w = frame.shape[:2]
+
+    # --- Pose skeleton (green) ---
+    if result.pose_detected and result.pose_landmarks is not None:
+        pose_lms = result.pose_landmarks
+        for i, j in POSE_UPPER_CONNECTIONS:
+            pt1 = (int(pose_lms[i].x * w), int(pose_lms[i].y * h))
+            pt2 = (int(pose_lms[j].x * w), int(pose_lms[j].y * h))
+            cv2.line(frame, pt1, pt2, (0, 200, 0), 2)
+        for idx in POSE_DRAW_INDICES:
+            pt = (int(pose_lms[idx].x * w), int(pose_lms[idx].y * h))
+            cv2.circle(frame, pt, 5, (0, 255, 0), -1)
+            cv2.circle(frame, pt, 5, (0, 150, 0), 1)
+
+    # --- Hand skeletons ---
+    for hand_idx, hand_lms in enumerate(result.hand_landmarks):
+        label = result.handedness[hand_idx][0].category_name
+        # Cyan-blue for signer's right (MediaPipe "Left"), orange for left
+        if label == "Left":
+            color, joint_color = (255, 200, 50), (255, 255, 100)
+        else:
+            color, joint_color = (50, 180, 255), (100, 220, 255)
+
+        for i, j in HAND_CONNECTIONS:
+            pt1 = (int(hand_lms[i].x * w), int(hand_lms[i].y * h))
+            pt2 = (int(hand_lms[j].x * w), int(hand_lms[j].y * h))
+            cv2.line(frame, pt1, pt2, color, 2)
+        for lm in hand_lms:
+            pt = (int(lm.x * w), int(lm.y * h))
+            cv2.circle(frame, pt, 3, joint_color, -1)
+
+    # --- HUD panel (semi-transparent bar at bottom) ---
+    panel_h = 90
+    overlay = frame[h - panel_h : h, :].copy()
+    cv2.rectangle(frame, (0, h - panel_h), (w, h), (30, 30, 30), -1)
+    cv2.addWeighted(overlay, 0.3, frame[h - panel_h : h, :], 0.7, 0,
+                    frame[h - panel_h : h, :])
+
+    y_base = h - panel_h + 22
+
+    # Detection status dots
+    def _dot(x, y, detected, label_text):
+        c = (0, 255, 0) if detected else (0, 0, 180)
+        cv2.circle(frame, (x, y - 5), 6, c, -1)
+        cv2.putText(frame, label_text, (x + 12, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+    _dot(15, y_base, result.pose_detected, "Pose")
+    _dot(95, y_base, result.left_detected, "L-Hand")
+    _dot(195, y_base, result.right_detected, "R-Hand")
+
+    # Counts
+    cv2.putText(frame, f"Frames: {frame_count}", (15, y_base + 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+    cv2.putText(frame, f"Sequences: {seq_count}", (140, y_base + 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+    # Sequence buffer progress bar
+    buf_fill = len(buffer._buffer)
+    buf_max = buffer.seq_len
+    bar_x, bar_y = 15, y_base + 40
+    bar_w, bar_h = w - 30, 16
+    fill_w = int(bar_w * buf_fill / buf_max) if buf_max > 0 else 0
+
+    cv2.rectangle(frame, (bar_x, bar_y),
+                  (bar_x + bar_w, bar_y + bar_h), (80, 80, 80), -1)
+    if fill_w > 0:
+        bar_color = (0, 255, 180) if buf_fill < buf_max else (0, 255, 255)
+        cv2.rectangle(frame, (bar_x, bar_y),
+                      (bar_x + fill_w, bar_y + bar_h), bar_color, -1)
+    cv2.rectangle(frame, (bar_x, bar_y),
+                  (bar_x + bar_w, bar_y + bar_h), (150, 150, 150), 1)
+    cv2.putText(frame, f"Buffer: {buf_fill}/{buf_max}",
+                (bar_x + 5, bar_y + 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    # Feature vector norm
+    if result.features is not None:
+        norm = float(np.linalg.norm(result.features))
+        cv2.putText(frame, f"||feat||={norm:.1f}",
+                    (bar_x + bar_w - 110, bar_y + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 255), 1)
+
+
+# ---------------------------------------------------------------------------
 # Quick self-test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import cv2
+    import time
 
     ensure_models()
     print(f"Hand model:  {HAND_MODEL_PATH}")
@@ -418,19 +582,16 @@ if __name__ == "__main__":
 
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        # Fallback to default backend
         cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("No camera available — skipping live test.")
     else:
         print("Camera open. Warming up...")
-        # Give camera time to initialize (Windows often needs this)
-        import time
         for _ in range(30):
             cap.read()
             time.sleep(0.03)
 
-        print("Press Q to quit.")
+        print("Tracking active. Press Q to quit.")
         frame_count = 0
         seq_count = 0
         fail_count = 0
@@ -446,20 +607,16 @@ if __name__ == "__main__":
             fail_count = 0
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            features = extractor.extract(rgb)
+            result = extractor.extract_with_landmarks(rgb)
 
-            status = "No pose"
-            if features is not None:
+            if result.features is not None:
                 frame_count += 1
-                seq = buf.add_frame(features)
-                status = f"Frame {frame_count} | features: {features.shape}"
+                seq = buf.add_frame(result.features)
                 if seq is not None:
                     seq_count += 1
-                    status += f" | seq {seq_count}: {seq.shape}"
 
-            cv2.putText(frame, status, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.imshow("Feature Extractor Test", frame)
+            draw_overlay(frame, result, buf, frame_count, seq_count)
+            cv2.imshow("ASL Feature Tracker", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
