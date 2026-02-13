@@ -1,11 +1,16 @@
 """Holistic feature extraction for ASL sign recognition.
 
-Uses MediaPipe Tasks API to extract hand and pose landmarks from video frames.
-Produces a per-frame feature vector of 225 dimensions:
+Uses MediaPipe Tasks API to extract hand, pose, and face landmarks from video
+frames.  Produces a per-frame feature vector of 345 dimensions:
   - Left hand:  21 landmarks × 3 coords (x, y, z) =  63
   - Right hand: 21 landmarks × 3 coords (x, y, z) =  63
   - Pose:       33 landmarks × 3 coords (x, y, z) =  99
-                                              Total: 225
+  - Face:       40 landmarks × 3 coords (x, y, z) = 120
+                                              Total: 345
+
+The face subset captures ASL-critical regions: eyebrows (grammatical markers
+for question types), eyes (emphasis / negation), lips & mouth (mouth morphemes),
+nose (reference point), and jaw (mouth opening).
 
 Landmarks are normalized relative to the mid-shoulder point and scaled by
 torso height for signer-invariant features.
@@ -31,6 +36,9 @@ os.environ.setdefault("GLOG_minloglevel", "3")
 import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    FaceLandmarkerResult,
     HandLandmarker,
     HandLandmarkerOptions,
     HandLandmarkerResult,
@@ -48,15 +56,48 @@ MODELS_DIR = Path(__file__).resolve().parent / "models"
 
 HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
 POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+FACE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
 
 HAND_MODEL_PATH = MODELS_DIR / "hand_landmarker.task"
 POSE_MODEL_PATH = MODELS_DIR / "pose_landmarker_lite.task"
+FACE_MODEL_PATH = MODELS_DIR / "face_landmarker.task"
 
 NUM_HAND_LANDMARKS = 21
 NUM_POSE_LANDMARKS = 33
 HAND_FEATURES = NUM_HAND_LANDMARKS * 3   # 63
 POSE_FEATURES = NUM_POSE_LANDMARKS * 3   # 99
-FRAME_FEATURES = HAND_FEATURES * 2 + POSE_FEATURES  # 225
+
+# ---------------------------------------------------------------------------
+# Face landmark subset — 40 key points for ASL grammar
+# ---------------------------------------------------------------------------
+# MediaPipe FaceMesh outputs 478 landmarks; we keep only the regions that
+# carry grammatical meaning in ASL.
+
+FACE_LANDMARK_INDICES = [
+    # Left eyebrow (5) — raised = yes/no question, furrowed = wh-question
+    70, 63, 105, 66, 107,
+    # Right eyebrow (5)
+    300, 293, 334, 296, 336,
+    # Left eye contour (6) — squint / wide = emphasis, negation
+    33, 160, 158, 133, 153, 144,
+    # Right eye contour (6)
+    362, 385, 387, 263, 380, 373,
+    # Nose bridge & tip (3) — reference point + nose wrinkle
+    1, 4, 5,
+    # Outer lips (8) — mouth morphemes modify sign meaning
+    61, 91, 0, 17, 321, 291, 39, 269,
+    # Inner lips (4) — open/closed/pursed/
+    13, 14, 78, 308,
+    # Chin (1) — jaw drop
+    152,
+    # Jaw corners (2) — jaw width / clench
+    234, 454,
+]
+
+NUM_FACE_LANDMARKS = len(FACE_LANDMARK_INDICES)  # 40
+FACE_FEATURES = NUM_FACE_LANDMARKS * 3            # 120
+
+FRAME_FEATURES = HAND_FEATURES * 2 + POSE_FEATURES + FACE_FEATURES  # 345
 
 # Pose landmark indices for normalization
 LEFT_SHOULDER = 11
@@ -88,6 +129,37 @@ POSE_UPPER_CONNECTIONS = [
 # Pose landmark indices to draw as joints
 POSE_DRAW_INDICES = {11, 12, 13, 14, 15, 16, 23, 24}
 
+# Face drawing connections (index into FACE_LANDMARK_INDICES, not raw 478-mesh)
+# We map raw→subset index for convenience:
+_FACE_IDX = {raw: i for i, raw in enumerate(FACE_LANDMARK_INDICES)}
+
+FACE_DRAW_CONNECTIONS = [
+    # Left eyebrow chain
+    (_FACE_IDX[70], _FACE_IDX[63]), (_FACE_IDX[63], _FACE_IDX[105]),
+    (_FACE_IDX[105], _FACE_IDX[66]), (_FACE_IDX[66], _FACE_IDX[107]),
+    # Right eyebrow chain
+    (_FACE_IDX[300], _FACE_IDX[293]), (_FACE_IDX[293], _FACE_IDX[334]),
+    (_FACE_IDX[334], _FACE_IDX[296]), (_FACE_IDX[296], _FACE_IDX[336]),
+    # Left eye loop
+    (_FACE_IDX[33], _FACE_IDX[160]), (_FACE_IDX[160], _FACE_IDX[158]),
+    (_FACE_IDX[158], _FACE_IDX[133]), (_FACE_IDX[133], _FACE_IDX[153]),
+    (_FACE_IDX[153], _FACE_IDX[144]), (_FACE_IDX[144], _FACE_IDX[33]),
+    # Right eye loop
+    (_FACE_IDX[362], _FACE_IDX[385]), (_FACE_IDX[385], _FACE_IDX[387]),
+    (_FACE_IDX[387], _FACE_IDX[263]), (_FACE_IDX[263], _FACE_IDX[380]),
+    (_FACE_IDX[380], _FACE_IDX[373]), (_FACE_IDX[373], _FACE_IDX[362]),
+    # Outer lips loop
+    (_FACE_IDX[61], _FACE_IDX[39]), (_FACE_IDX[39], _FACE_IDX[0]),
+    (_FACE_IDX[0], _FACE_IDX[269]), (_FACE_IDX[269], _FACE_IDX[291]),
+    (_FACE_IDX[291], _FACE_IDX[321]), (_FACE_IDX[321], _FACE_IDX[17]),
+    (_FACE_IDX[17], _FACE_IDX[91]), (_FACE_IDX[91], _FACE_IDX[61]),
+    # Inner lips loop
+    (_FACE_IDX[78], _FACE_IDX[13]), (_FACE_IDX[13], _FACE_IDX[308]),
+    (_FACE_IDX[308], _FACE_IDX[14]), (_FACE_IDX[14], _FACE_IDX[78]),
+    # Nose bridge
+    (_FACE_IDX[1], _FACE_IDX[4]), (_FACE_IDX[4], _FACE_IDX[5]),
+]
+
 
 # ---------------------------------------------------------------------------
 # Model download
@@ -104,9 +176,10 @@ def _download_model(url: str, dest: Path) -> None:
 
 
 def ensure_models() -> None:
-    """Download hand and pose model files if not already present."""
+    """Download hand, pose, and face model files if not already present."""
     _download_model(HAND_MODEL_URL, HAND_MODEL_PATH)
     _download_model(POSE_MODEL_URL, POSE_MODEL_PATH)
+    _download_model(FACE_MODEL_URL, FACE_MODEL_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +196,21 @@ def _pose_landmarks_to_array(landmarks) -> np.ndarray:
     return np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32)
 
 
+def _face_landmarks_to_array(landmarks) -> np.ndarray:
+    """Extract the 40-landmark face subset from full 478-point mesh."""
+    return np.array(
+        [[landmarks[i].x, landmarks[i].y, landmarks[i].z] for i in FACE_LANDMARK_INDICES],
+        dtype=np.float32,
+    )
+
+
 def _normalize_frame(
     left_hand: np.ndarray,
     right_hand: np.ndarray,
     pose: np.ndarray,
+    face: np.ndarray,
 ) -> np.ndarray:
-    """Normalize landmarks and flatten to a (225,) feature vector.
+    """Normalize landmarks and flatten to a (345,) feature vector.
 
     Normalization:
     1. Translate all landmarks so mid-shoulder is the origin.
@@ -145,16 +227,19 @@ def _normalize_frame(
     left_hand = left_hand - mid_shoulder
     right_hand = right_hand - mid_shoulder
     pose = pose - mid_shoulder
+    face = face - mid_shoulder
 
     # Scale
     left_hand /= torso_height
     right_hand /= torso_height
     pose /= torso_height
+    face /= torso_height
 
     return np.concatenate([
         left_hand.flatten(),
         right_hand.flatten(),
         pose.flatten(),
+        face.flatten(),
     ])
 
 
@@ -165,13 +250,16 @@ def _normalize_frame(
 @dataclass
 class ExtractionResult:
     """Carries both the normalized feature vector and raw landmarks for drawing."""
-    features: np.ndarray | None = None        # (225,) or None if no pose
+    features: np.ndarray | None = None        # (345,) or None if no pose
     pose_landmarks: list | None = None        # raw MediaPipe pose landmark list
     hand_landmarks: list = field(default_factory=list)  # raw hand landmark lists
     handedness: list = field(default_factory=list)       # handedness per detected hand
+    face_landmarks: list | None = None        # raw 478-point face mesh (or None)
+    face_subset: np.ndarray | None = None     # (40, 3) extracted subset for drawing
     left_detected: bool = False
     right_detected: bool = False
     pose_detected: bool = False
+    face_detected: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -220,10 +308,21 @@ class FeatureExtractor:
             )
         )
 
+        self._face_landmarker = FaceLandmarker.create_from_options(
+            FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(FACE_MODEL_PATH)),
+                running_mode=running_mode,
+                num_faces=1,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        )
+
         self._mode = mode
 
     def _detect(self, frame_rgb: np.ndarray, timestamp_ms: int = 0):
-        """Run MediaPipe pose + hand detection on a single frame."""
+        """Run MediaPipe pose + hand + face detection on a single frame."""
         mp_image = mp.Image(
             image_format=mp.ImageFormat.SRGB,
             data=frame_rgb,
@@ -232,11 +331,13 @@ class FeatureExtractor:
         if self._mode == "video":
             pose_result = self._pose_landmarker.detect_for_video(mp_image, timestamp_ms)
             hand_result = self._hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+            face_result = self._face_landmarker.detect_for_video(mp_image, timestamp_ms)
         else:
             pose_result = self._pose_landmarker.detect(mp_image)
             hand_result = self._hand_landmarker.detect(mp_image)
+            face_result = self._face_landmarker.detect(mp_image)
 
-        return pose_result, hand_result
+        return pose_result, hand_result, face_result
 
     @staticmethod
     def _sort_hands(hand_result):
@@ -264,18 +365,25 @@ class FeatureExtractor:
         frame_rgb: np.ndarray,
         timestamp_ms: int = 0,
     ) -> np.ndarray | None:
-        """Extract a 225-dim feature vector from a single RGB frame.
+        """Extract a 345-dim feature vector from a single RGB frame.
 
-        Returns (225,) feature vector, or None if pose not detected.
+        Returns (345,) feature vector, or None if pose not detected.
         """
-        pose_result, hand_result = self._detect(frame_rgb, timestamp_ms)
+        pose_result, hand_result, face_result = self._detect(frame_rgb, timestamp_ms)
 
         if not pose_result.pose_landmarks:
             return None
 
         pose = _pose_landmarks_to_array(pose_result.pose_landmarks[0])
         left_hand, right_hand, _, _ = self._sort_hands(hand_result)
-        return _normalize_frame(left_hand, right_hand, pose)
+
+        # Face: use detected landmarks or zero-fill
+        if face_result.face_landmarks:
+            face = _face_landmarks_to_array(face_result.face_landmarks[0])
+        else:
+            face = np.zeros((NUM_FACE_LANDMARKS, 3), dtype=np.float32)
+
+        return _normalize_frame(left_hand, right_hand, pose, face)
 
     def extract_with_landmarks(
         self,
@@ -286,34 +394,49 @@ class FeatureExtractor:
 
         Always returns an ExtractionResult; features is None if no pose detected.
         """
-        pose_result, hand_result = self._detect(frame_rgb, timestamp_ms)
+        pose_result, hand_result, face_result = self._detect(frame_rgb, timestamp_ms)
 
         raw_hands = list(hand_result.hand_landmarks) if hand_result.hand_landmarks else []
         raw_handedness = list(hand_result.handedness) if hand_result.handedness else []
+
+        face_detected = bool(face_result.face_landmarks)
+        raw_face = face_result.face_landmarks[0] if face_detected else None
+        face_sub = _face_landmarks_to_array(raw_face) if face_detected else None
 
         if not pose_result.pose_landmarks:
             return ExtractionResult(
                 hand_landmarks=raw_hands,
                 handedness=raw_handedness,
+                face_landmarks=raw_face,
+                face_subset=face_sub,
+                face_detected=face_detected,
             )
 
         pose = _pose_landmarks_to_array(pose_result.pose_landmarks[0])
         left_hand, right_hand, left_det, right_det = self._sort_hands(hand_result)
 
+        face_arr = face_sub if face_sub is not None else np.zeros(
+            (NUM_FACE_LANDMARKS, 3), dtype=np.float32
+        )
+
         return ExtractionResult(
-            features=_normalize_frame(left_hand, right_hand, pose),
+            features=_normalize_frame(left_hand, right_hand, pose, face_arr),
             pose_landmarks=pose_result.pose_landmarks[0],
             hand_landmarks=raw_hands,
             handedness=raw_handedness,
+            face_landmarks=raw_face,
+            face_subset=face_sub,
             left_detected=left_det,
             right_detected=right_det,
             pose_detected=True,
+            face_detected=face_detected,
         )
 
     def close(self) -> None:
         """Release MediaPipe resources."""
         self._hand_landmarker.close()
         self._pose_landmarker.close()
+        self._face_landmarker.close()
 
     def __enter__(self):
         return self
@@ -510,6 +633,20 @@ def draw_overlay(
             pt = (int(lm.x * w), int(lm.y * h))
             cv2.circle(frame, pt, 3, joint_color, -1)
 
+    # --- Face landmarks (magenta / pink) ---
+    if result.face_detected and result.face_landmarks is not None:
+        face_lms = result.face_landmarks
+        # Draw connections using the subset indices mapped to raw mesh
+        for si, sj in FACE_DRAW_CONNECTIONS:
+            ri, rj = FACE_LANDMARK_INDICES[si], FACE_LANDMARK_INDICES[sj]
+            pt1 = (int(face_lms[ri].x * w), int(face_lms[ri].y * h))
+            pt2 = (int(face_lms[rj].x * w), int(face_lms[rj].y * h))
+            cv2.line(frame, pt1, pt2, (200, 100, 255), 1)
+        # Draw joints
+        for raw_idx in FACE_LANDMARK_INDICES:
+            pt = (int(face_lms[raw_idx].x * w), int(face_lms[raw_idx].y * h))
+            cv2.circle(frame, pt, 2, (255, 150, 255), -1)
+
     # --- HUD panel (semi-transparent bar at bottom) ---
     panel_h = 90
     overlay = frame[h - panel_h : h, :].copy()
@@ -529,6 +666,7 @@ def draw_overlay(
     _dot(15, y_base, result.pose_detected, "Pose")
     _dot(95, y_base, result.left_detected, "L-Hand")
     _dot(195, y_base, result.right_detected, "R-Hand")
+    _dot(295, y_base, result.face_detected, "Face")
 
     # Counts
     cv2.putText(frame, f"Frames: {frame_count}", (15, y_base + 25),
@@ -574,7 +712,8 @@ if __name__ == "__main__":
     ensure_models()
     print(f"Hand model:  {HAND_MODEL_PATH}")
     print(f"Pose model:  {POSE_MODEL_PATH}")
-    print(f"Features per frame: {FRAME_FEATURES}")
+    print(f"Face model:  {FACE_MODEL_PATH}")
+    print(f"Features per frame: {FRAME_FEATURES}  (hands {HAND_FEATURES*2} + pose {POSE_FEATURES} + face {FACE_FEATURES})")
     print()
 
     extractor = FeatureExtractor(mode="image")
