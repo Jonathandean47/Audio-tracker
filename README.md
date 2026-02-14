@@ -4,7 +4,7 @@ Offline real-time translator for Windows — spoken English (mic) → text, and 
 
 ## Features
 - **Voice mode**: Live speech transcription from mic using Vosk (fully offline)
-- **ASL mode**: Word-level ASL sign recognition from camera or video files
+- **ASL mode** (WIP): Word-level ASL sign recognition from camera or video files
   - MediaPipe holistic landmarks (hands + pose + face)
   - 345-feature vectors per frame (21×3 per hand + 33×3 pose + 40×3 face)
   - Sequence-based classification with rolling frame buffer
