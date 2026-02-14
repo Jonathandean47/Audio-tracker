@@ -1,6 +1,6 @@
 # Audio Tracker
 
-Offline real-time translator for Windows — spoken English (mic) → text, and ASL signs (camera/video) → text.
+Offline real-time translator for Windows — spoken English (mic) → text, and ASL signs (camera/video) → text. (WIP)
 
 ## Features
 - **Voice mode**: Live speech transcription from mic using Vosk (fully offline)
