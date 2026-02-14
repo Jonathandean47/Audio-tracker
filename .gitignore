@@ -6,5 +6,6 @@ transcripts/
 asl_data/
 asl_model.pkl
 video_cache/
+wlasl_data/
 todo.md
 models/
